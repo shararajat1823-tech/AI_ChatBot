@@ -61,7 +61,10 @@
   };
 
   const DEFAULT_SYSTEM = "You are a helpful, friendly, and concise AI assistant.";
-  const TIMEOUT_MS = 45000;
+  const TIMEOUT_TEXT = 60000; // time-to-first-token budget for text
+  const TIMEOUT_IMAGE = 120000; // vision requests legitimately take longer
+  const IMG_MAX_DIM = 1024; // downscale attachments to this max side
+  const IMG_QUALITY = 0.8; // JPEG quality for attachments
 
   // ---- State ------------------------------------------------------------
   const LS = { settings: "aichatbot.settings", chats: "aichatbot.chats", theme: "aichatbot.theme" };
@@ -283,9 +286,36 @@
   function handleFiles(files) {
     [...files].forEach((f) => {
       if (!f.type.startsWith("image/")) return;
+      compressImage(f).then((dataUrl) => { pendingImages.push(dataUrl); renderAttachments(); });
+    });
+  }
+
+  // Downscale + re-encode an image so vision payloads stay small and fast.
+  function compressImage(file) {
+    return new Promise((resolve) => {
       const reader = new FileReader();
-      reader.onload = () => { pendingImages.push(reader.result); renderAttachments(); };
-      reader.readAsDataURL(f);
+      reader.onload = () => {
+        const img = new Image();
+        img.onload = () => {
+          let { width, height } = img;
+          if (width > IMG_MAX_DIM || height > IMG_MAX_DIM) {
+            const scale = IMG_MAX_DIM / Math.max(width, height);
+            width = Math.round(width * scale);
+            height = Math.round(height * scale);
+          }
+          try {
+            const canvas = document.createElement("canvas");
+            canvas.width = width; canvas.height = height;
+            canvas.getContext("2d").drawImage(img, 0, 0, width, height);
+            resolve(canvas.toDataURL("image/jpeg", IMG_QUALITY));
+          } catch {
+            resolve(reader.result); // fallback to original on any canvas error
+          }
+        };
+        img.onerror = () => resolve(reader.result);
+        img.src = reader.result;
+      };
+      reader.readAsDataURL(file);
     });
   }
 
@@ -390,9 +420,11 @@
       scrollToBottom();
     };
 
-    let timer = setTimeout(fireTimeout, TIMEOUT_MS);
+    const hasImages = chat.messages.some((m) => m.images && m.images.length);
+    const timeoutMs = hasImages ? TIMEOUT_IMAGE : TIMEOUT_TEXT;
+    let timer = setTimeout(fireTimeout, timeoutMs);
     function fireTimeout() { timedOut = true; if (currentAbort) currentAbort.abort(); }
-    const kick = () => { clearTimeout(timer); timer = setTimeout(fireTimeout, TIMEOUT_MS); };
+    const kick = () => { clearTimeout(timer); timer = setTimeout(fireTimeout, timeoutMs); };
 
     const onDelta = (chunk) => {
       if (!chunk) return;
