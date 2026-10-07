@@ -1,13 +1,14 @@
 /* =========================================================================
    AI ChatBot — front-end logic
    A static, GitHub-Pages-hostable chatbot. Each user brings their OWN free
-   API key, which is stored only in their browser's localStorage.
+   API key, stored only in their browser's localStorage.
 
-   Supports: Google Gemini (native) + any OpenAI-compatible API (Groq,
-   OpenRouter, custom).
+   Providers: Google Gemini (native) + any OpenAI-compatible API
+   (Groq, OpenRouter, custom).
 
-   Features: streaming replies, stop/regenerate, request timeout with
-   friendly errors, and voice input (Web Speech API).
+   Features: streaming replies, stop/regenerate, request timeout + friendly
+   errors, voice input & output, image (vision) input, edit/copy messages,
+   and an in-header model picker.
    ========================================================================= */
 
 (() => {
@@ -47,15 +48,23 @@
     },
   };
 
+  // Suggested models shown in the header dropdown (users can still set any in Settings).
+  const MODELS = {
+    gemini: ["gemini-flash-latest", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro-latest"],
+    groq: ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768", "gemma2-9b-it"],
+    openrouter: [
+      "meta-llama/llama-3.3-70b-instruct:free",
+      "google/gemini-2.0-flash-exp:free",
+      "mistralai/mistral-7b-instruct:free",
+    ],
+    custom: [],
+  };
+
   const DEFAULT_SYSTEM = "You are a helpful, friendly, and concise AI assistant.";
-  const TIMEOUT_MS = 45000; // abort if no activity for this long
+  const TIMEOUT_MS = 45000;
 
   // ---- State ------------------------------------------------------------
-  const LS = {
-    settings: "aichatbot.settings",
-    chats: "aichatbot.chats",
-    theme: "aichatbot.theme",
-  };
+  const LS = { settings: "aichatbot.settings", chats: "aichatbot.chats", theme: "aichatbot.theme" };
 
   let settings = loadJSON(LS.settings, {
     provider: "gemini",
@@ -63,95 +72,89 @@
     model: "",
     baseUrl: "",
     systemPrompt: DEFAULT_SYSTEM,
+    autoSpeak: false,
   });
 
-  let chats = loadJSON(LS.chats, []); // [{id, title, messages:[{role, content}]}]
+  let chats = loadJSON(LS.chats, []); // [{id, title, messages:[{role, content, images?}]}]
   let currentId = chats.length ? chats[0].id : null;
   let busy = false;
-  let currentAbort = null; // AbortController for the in-flight request
+  let currentAbort = null;
   let stopRequested = false;
   let timedOut = false;
+  let pendingImages = []; // data-URLs attached to the next message
 
   // ---- Element refs -----------------------------------------------------
   const $ = (id) => document.getElementById(id);
   const el = {
-    messages: $("messages"),
-    welcome: $("welcome"),
-    input: $("input"),
-    composer: $("composer"),
-    sendBtn: $("sendBtn"),
-    micBtn: $("micBtn"),
-    actionBar: $("actionBar"),
-    regenBtn: $("regenBtn"),
-    historyList: $("historyList"),
-    headerTitle: $("headerTitle"),
-    statusPill: $("statusPill"),
-    newChatBtn: $("newChatBtn"),
-    sidebar: $("sidebar"),
-    openSidebar: $("openSidebar"),
-    closeSidebar: $("closeSidebar"),
-    openSettings: $("openSettings"),
-    closeSettings: $("closeSettings"),
-    settingsBackdrop: $("settingsBackdrop"),
-    saveSettings: $("saveSettings"),
-    clearData: $("clearData"),
-    themeToggle: $("themeToggle"),
-    provider: $("provider"),
-    apiKey: $("apiKey"),
-    model: $("model"),
-    baseUrl: $("baseUrl"),
-    baseUrlRow: $("baseUrlRow"),
-    systemPrompt: $("systemPrompt"),
-    keyHint: $("keyHint"),
-    toggleKey: $("toggleKey"),
-    toast: $("toast"),
+    messages: $("messages"), welcome: $("welcome"), input: $("input"), composer: $("composer"),
+    sendBtn: $("sendBtn"), micBtn: $("micBtn"), attachBtn: $("attachBtn"), fileInput: $("fileInput"),
+    attachments: $("attachments"), actionBar: $("actionBar"), regenBtn: $("regenBtn"),
+    historyList: $("historyList"), headerTitle: $("headerTitle"),
+    providerLabel: $("providerLabel"), modelSelect: $("modelSelect"),
+    newChatBtn: $("newChatBtn"), sidebar: $("sidebar"), openSidebar: $("openSidebar"), closeSidebar: $("closeSidebar"),
+    openSettings: $("openSettings"), closeSettings: $("closeSettings"), settingsBackdrop: $("settingsBackdrop"),
+    saveSettings: $("saveSettings"), clearData: $("clearData"), themeToggle: $("themeToggle"),
+    provider: $("provider"), apiKey: $("apiKey"), model: $("model"), baseUrl: $("baseUrl"),
+    baseUrlRow: $("baseUrlRow"), systemPrompt: $("systemPrompt"), autoSpeak: $("autoSpeak"),
+    keyHint: $("keyHint"), toggleKey: $("toggleKey"), toast: $("toast"),
   };
 
   // ---- Helpers ----------------------------------------------------------
   function loadJSON(key, fallback) {
-    try {
-      const v = localStorage.getItem(key);
-      return v ? JSON.parse(v) : fallback;
-    } catch {
-      return fallback;
-    }
+    try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; } catch { return fallback; }
   }
-  function saveJSON(key, val) {
-    try {
-      localStorage.setItem(key, JSON.stringify(val));
-    } catch {
-      /* storage may be blocked (private mode) — app still works in-memory */
-    }
-  }
+  function saveJSON(key, val) { try { localStorage.setItem(key, JSON.stringify(val)); } catch {} }
   const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 
   let toastTimer;
   function toast(msg) {
-    el.toast.textContent = msg;
-    el.toast.hidden = false;
-    clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => (el.toast.hidden = true), 3200);
+    el.toast.textContent = msg; el.toast.hidden = false;
+    clearTimeout(toastTimer); toastTimer = setTimeout(() => (el.toast.hidden = true), 3200);
   }
 
-  function currentChat() {
-    return chats.find((c) => c.id === currentId) || null;
-  }
-
+  const currentChat = () => chats.find((c) => c.id === currentId) || null;
   function activeModel() {
     const p = PROVIDERS[settings.provider] || PROVIDERS.gemini;
     return settings.model || p.defaultModel;
   }
 
-  // ---- Rendering --------------------------------------------------------
-  function renderStatus() {
-    const p = PROVIDERS[settings.provider];
-    if (!settings.apiKey) {
-      el.statusPill.textContent = "Not configured";
-      el.statusPill.style.color = "var(--danger)";
-    } else {
-      el.statusPill.textContent = `${p ? p.label : "AI"} · ${activeModel()}`;
-      el.statusPill.style.color = "";
+  // Persist chats; if images blow the storage quota, fall back to saving without image blobs.
+  function persist() {
+    try {
+      localStorage.setItem(LS.chats, JSON.stringify(chats));
+    } catch {
+      try {
+        const light = chats.map((c) => ({
+          ...c,
+          messages: c.messages.map((m) => (m.images && m.images.length ? { ...m, images: [] } : m)),
+        }));
+        localStorage.setItem(LS.chats, JSON.stringify(light));
+      } catch {}
     }
+  }
+
+  // ---- Rendering --------------------------------------------------------
+  function populateModelSelect() {
+    const prov = settings.provider;
+    const list = [...(MODELS[prov] || [])];
+    const cur = activeModel();
+    if (cur && !list.includes(cur)) list.unshift(cur);
+    el.modelSelect.innerHTML = "";
+    if (!list.length) {
+      const o = document.createElement("option");
+      o.textContent = "(set model in Settings)"; o.disabled = true;
+      el.modelSelect.appendChild(o);
+    } else {
+      list.forEach((m) => {
+        const o = document.createElement("option");
+        o.value = m; o.textContent = m;
+        el.modelSelect.appendChild(o);
+      });
+      el.modelSelect.value = cur;
+    }
+    const label = PROVIDERS[prov] ? PROVIDERS[prov].label : "AI";
+    el.providerLabel.textContent = (settings.apiKey ? "" : "⚠️ ") + label;
+    el.providerLabel.style.color = settings.apiKey ? "" : "var(--danger)";
   }
 
   function renderHistory() {
@@ -162,10 +165,7 @@
       item.innerHTML = `<span class="label">💬 ${escapeHtml(c.title)}</span>
         <button class="del" title="Delete" aria-label="Delete chat">🗑️</button>`;
       item.querySelector(".label").onclick = () => selectChat(c.id);
-      item.querySelector(".del").onclick = (e) => {
-        e.stopPropagation();
-        deleteChat(c.id);
-      };
+      item.querySelector(".del").onclick = (e) => { e.stopPropagation(); deleteChat(c.id); };
       el.historyList.appendChild(item);
     });
   }
@@ -181,174 +181,206 @@
       return;
     }
     el.welcome.style.display = "none";
-    chat.messages.forEach((m) => el.messages.appendChild(messageEl(m.role, m.content)));
+    chat.messages.forEach((m, i) => el.messages.appendChild(messageEl(m, i)));
     el.headerTitle.textContent = chat.title;
     updateActionBar();
     scrollToBottom();
   }
 
-  function messageEl(role, content) {
+  // Build one message row (avatar + bubble + hover actions).
+  function messageEl(m, index) {
+    const isUser = m.role === "user";
     const row = document.createElement("div");
-    row.className = `msg-row ${role === "user" ? "user" : "bot"}`;
+    row.className = `msg-row ${isUser ? "user" : "bot"}`;
+
     const avatar = document.createElement("div");
-    avatar.className = `avatar ${role === "user" ? "user" : "bot"}`;
-    avatar.textContent = role === "user" ? "🧑" : "🤖";
+    avatar.className = `avatar ${isUser ? "user" : "bot"}`;
+    avatar.textContent = isUser ? "🧑" : "🤖";
+
+    const col = document.createElement("div");
+    col.className = "bubble-col";
+
     const bubble = document.createElement("div");
     bubble.className = "bubble";
-    if (role === "user") {
-      bubble.textContent = content;
-    } else {
-      bubble.innerHTML = renderMarkdown(content);
-      enhanceCodeBlocks(bubble);
+    if (m.images && m.images.length) {
+      m.images.forEach((src) => {
+        const img = document.createElement("img");
+        img.className = "msg-img"; img.src = src; img.alt = "attached image";
+        bubble.appendChild(img);
+      });
     }
+    if (isUser) {
+      if (m.content) bubble.appendChild(document.createTextNode(m.content));
+    } else {
+      const span = document.createElement("div");
+      span.innerHTML = renderMarkdown(m.content);
+      enhanceCodeBlocks(span);
+      bubble.appendChild(span);
+    }
+    col.appendChild(bubble);
+
+    // Hover action buttons
+    const actions = document.createElement("div");
+    actions.className = "msg-actions";
+    if (m.content) {
+      const copy = actBtn("📋 Copy", () => {
+        navigator.clipboard.writeText(m.content).then(() => toast("Copied!"));
+      });
+      actions.appendChild(copy);
+    }
+    if (isUser) {
+      actions.appendChild(actBtn("✏️ Edit", () => editMessage(index)));
+    } else if (m.content) {
+      const speak = actBtn("🔊 Speak", () => toggleSpeak(m.content, speak));
+      actions.appendChild(speak);
+    }
+    col.appendChild(actions);
+
     row.appendChild(avatar);
-    row.appendChild(bubble);
+    row.appendChild(col);
     return row;
+  }
+
+  function actBtn(label, onClick) {
+    const b = document.createElement("button");
+    b.className = "msg-act"; b.type = "button"; b.textContent = label;
+    b.onclick = onClick;
+    return b;
   }
 
   function renderMarkdown(text) {
     if (window.marked) {
-      try {
-        return window.marked.parse(text, { breaks: true, gfm: true });
-      } catch {
-        /* fall through */
-      }
+      try { return window.marked.parse(text, { breaks: true, gfm: true }); } catch {}
     }
     return escapeHtml(text).replace(/\n/g, "<br>");
   }
 
   function enhanceCodeBlocks(container) {
     container.querySelectorAll("pre code").forEach((code) => {
-      if (window.hljs) {
-        try {
-          window.hljs.highlightElement(code);
-        } catch {}
-      }
+      if (window.hljs) { try { window.hljs.highlightElement(code); } catch {} }
       const pre = code.parentElement;
       if (pre.querySelector(".code-head")) return;
       const head = document.createElement("div");
       head.className = "code-head";
       const lang = (code.className.match(/language-(\w+)/) || [, "code"])[1];
       head.innerHTML = `<span>${lang}</span><button class="copy-btn">Copy</button>`;
-      head.querySelector(".copy-btn").onclick = () => {
+      head.querySelector(".copy-btn").onclick = () =>
         navigator.clipboard.writeText(code.textContent).then(() => toast("Copied!"));
-      };
       pre.insertBefore(head, code);
     });
   }
 
-  function escapeHtml(s) {
-    const d = document.createElement("div");
-    d.textContent = s;
-    return d.innerHTML;
-  }
-
-  function scrollToBottom() {
-    el.messages.scrollTop = el.messages.scrollHeight;
-  }
+  function escapeHtml(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+  function scrollToBottom() { el.messages.scrollTop = el.messages.scrollHeight; }
 
   function updateActionBar() {
     const chat = currentChat();
-    const lastIsBot =
-      chat && chat.messages.length && chat.messages[chat.messages.length - 1].role === "assistant";
+    const lastIsBot = chat && chat.messages.length && chat.messages[chat.messages.length - 1].role === "assistant";
     el.actionBar.hidden = !(lastIsBot && !busy);
+  }
+
+  // ---- Attachments (image input) ----------------------------------------
+  function handleFiles(files) {
+    [...files].forEach((f) => {
+      if (!f.type.startsWith("image/")) return;
+      const reader = new FileReader();
+      reader.onload = () => { pendingImages.push(reader.result); renderAttachments(); };
+      reader.readAsDataURL(f);
+    });
+  }
+
+  function renderAttachments() {
+    el.attachments.innerHTML = "";
+    el.attachments.hidden = pendingImages.length === 0;
+    pendingImages.forEach((src, i) => {
+      const thumb = document.createElement("div");
+      thumb.className = "attach-thumb";
+      thumb.innerHTML = `<img src="${src}" alt="attachment" /><button class="rm" title="Remove">✕</button>`;
+      thumb.querySelector(".rm").onclick = () => {
+        pendingImages.splice(i, 1);
+        renderAttachments();
+      };
+      el.attachments.appendChild(thumb);
+    });
   }
 
   // ---- Chat management --------------------------------------------------
   function newChat() {
+    stopSpeak();
     const chat = { id: uid(), title: "New chat", messages: [] };
-    chats.unshift(chat);
-    currentId = chat.id;
-    persist();
-    renderHistory();
-    renderMessages();
-    renderStatus();
-    closeSidebarMobile();
+    chats.unshift(chat); currentId = chat.id;
+    pendingImages = []; renderAttachments();
+    persist(); renderHistory(); renderMessages(); populateModelSelect(); closeSidebarMobile();
     el.input.focus();
   }
-
-  function selectChat(id) {
-    currentId = id;
-    renderHistory();
-    renderMessages();
-    closeSidebarMobile();
-  }
-
+  function selectChat(id) { stopSpeak(); currentId = id; renderHistory(); renderMessages(); closeSidebarMobile(); }
   function deleteChat(id) {
     chats = chats.filter((c) => c.id !== id);
     if (currentId === id) currentId = chats.length ? chats[0].id : null;
-    persist();
-    renderHistory();
-    renderMessages();
+    persist(); renderHistory(); renderMessages();
   }
 
-  function persist() {
-    saveJSON(LS.chats, chats);
+  function editMessage(index) {
+    const chat = currentChat();
+    if (!chat || busy) return;
+    const m = chat.messages[index];
+    el.input.value = m.content || "";
+    pendingImages = (m.images || []).slice();
+    renderAttachments();
+    autoResize();
+    chat.messages = chat.messages.slice(0, index); // drop this msg and everything after
+    persist(); renderMessages(); el.input.focus();
+    toast("Edit your message, then send again");
   }
 
   // ---- Sending / generating ---------------------------------------------
   async function sendMessage(text) {
-    text = text.trim();
-    if (!text || busy) return;
+    text = (text || "").trim();
+    if ((!text && pendingImages.length === 0) || busy) return;
 
-    if (!settings.apiKey) {
-      openSettings();
-      toast("Add your free API key first 🔑");
-      return;
-    }
+    if (!settings.apiKey) { openSettings(); toast("Add your free API key first 🔑"); return; }
 
     let chat = currentChat();
-    if (!chat) {
-      newChat();
-      chat = currentChat();
-    }
+    if (!chat) { newChat(); chat = currentChat(); }
 
-    chat.messages.push({ role: "user", content: text });
+    const msg = { role: "user", content: text };
+    if (pendingImages.length) msg.images = pendingImages.slice();
+    chat.messages.push(msg);
+    pendingImages = []; renderAttachments();
+
     if (chat.title === "New chat") {
-      chat.title = text.slice(0, 40) + (text.length > 40 ? "…" : "");
+      chat.title = (text || "Image").slice(0, 40) + (text.length > 40 ? "…" : "");
     }
     el.welcome.style.display = "none";
-    el.messages.appendChild(messageEl("user", text));
+    el.messages.appendChild(messageEl(msg, chat.messages.length - 1));
     el.headerTitle.textContent = chat.title;
-    renderHistory();
-    scrollToBottom();
-    persist();
+    renderHistory(); scrollToBottom(); persist();
 
     await generateReply(chat);
   }
 
-  // Re-generate the reply to the most recent user message.
   function regenerate() {
     const chat = currentChat();
     if (!chat || busy) return;
-    while (chat.messages.length && chat.messages[chat.messages.length - 1].role === "assistant") {
-      chat.messages.pop();
-    }
+    while (chat.messages.length && chat.messages[chat.messages.length - 1].role === "assistant") chat.messages.pop();
     if (!chat.messages.some((m) => m.role === "user")) return;
-    persist();
-    renderMessages();
+    persist(); renderMessages();
     generateReply(chat);
   }
 
-  // Core generation routine: streams the reply into a fresh bot bubble.
   async function generateReply(chat) {
     setBusy(true);
-    stopRequested = false;
-    timedOut = false;
+    stopRequested = false; timedOut = false;
 
-    // Create the bot bubble up front; we stream text into it.
     const row = document.createElement("div");
     row.className = "msg-row bot";
-    row.innerHTML = `<div class="avatar bot">🤖</div><div class="bubble"></div>`;
+    row.innerHTML = `<div class="avatar bot">🤖</div><div class="bubble-col"><div class="bubble"></div></div>`;
     const bubble = row.querySelector(".bubble");
     bubble.innerHTML = `<div class="typing"><span></span><span></span><span></span></div>`;
-    el.messages.appendChild(row);
-    scrollToBottom();
+    el.messages.appendChild(row); scrollToBottom();
 
     currentAbort = new AbortController();
-    let acc = "";
-    let gotFirst = false;
-    let lastPaint = 0;
+    let acc = "", gotFirst = false, lastPaint = 0;
 
     const paint = (force) => {
       const now = Date.now();
@@ -358,69 +390,40 @@
       scrollToBottom();
     };
 
-    let timer = setTimeout(() => {
-      timedOut = true;
-      if (currentAbort) currentAbort.abort();
-    }, TIMEOUT_MS);
-    const kick = () => {
-      clearTimeout(timer);
-      timer = setTimeout(() => {
-        timedOut = true;
-        if (currentAbort) currentAbort.abort();
-      }, TIMEOUT_MS);
-    };
+    let timer = setTimeout(fireTimeout, TIMEOUT_MS);
+    function fireTimeout() { timedOut = true; if (currentAbort) currentAbort.abort(); }
+    const kick = () => { clearTimeout(timer); timer = setTimeout(fireTimeout, TIMEOUT_MS); };
 
     const onDelta = (chunk) => {
       if (!chunk) return;
-      if (!gotFirst) {
-        gotFirst = true;
-        bubble.innerHTML = "";
-      }
-      acc += chunk;
-      kick();
-      paint(false);
+      if (!gotFirst) { gotFirst = true; bubble.innerHTML = ""; }
+      acc += chunk; kick(); paint(false);
     };
 
     try {
       await callAPIStream(chat.messages, onDelta, currentAbort.signal);
       clearTimeout(timer);
-      finalizeBubble(bubble, acc || "_(empty response)_");
-      chat.messages.push({ role: "assistant", content: acc });
-      persist();
+      chat.messages.push({ role: "assistant", content: acc || "_(empty response)_" });
+      persist(); renderMessages();
+      if (settings.autoSpeak && acc) toggleSpeak(acc, null, true);
     } catch (err) {
       clearTimeout(timer);
-      if (stopRequested && acc) {
-        // User stopped — keep whatever streamed so far.
-        finalizeBubble(bubble, acc + "\n\n_⏹ Stopped._");
-        chat.messages.push({ role: "assistant", content: acc + "\n\n_⏹ Stopped._" });
-      } else if (timedOut) {
-        const msg =
-          (acc ? acc + "\n\n" : "") +
+      let msg;
+      if (stopRequested && acc) msg = acc + "\n\n_⏹ Stopped._";
+      else if (timedOut)
+        msg = (acc ? acc + "\n\n" : "") +
           "⚠️ **Request timed out.** The provider didn't respond in time. Check your model name/key, or try again.";
-        finalizeBubble(bubble, msg);
-        chat.messages.push({ role: "assistant", content: msg });
-      } else {
-        const msg = "⚠️ " + friendlyError(err);
-        finalizeBubble(bubble, msg);
-        chat.messages.push({ role: "assistant", content: msg });
-      }
-      persist();
+      else msg = "⚠️ " + friendlyError(err);
+      chat.messages.push({ role: "assistant", content: msg });
+      persist(); renderMessages();
     } finally {
-      currentAbort = null;
-      setBusy(false);
+      currentAbort = null; setBusy(false);
     }
-  }
-
-  function finalizeBubble(bubble, text) {
-    bubble.innerHTML = renderMarkdown(text);
-    enhanceCodeBlocks(bubble);
-    scrollToBottom();
   }
 
   function stopGeneration() {
     if (!busy || !currentAbort) return;
-    stopRequested = true;
-    currentAbort.abort();
+    stopRequested = true; currentAbort.abort();
   }
 
   function friendlyError(err) {
@@ -439,15 +442,9 @@
 
   function setBusy(v) {
     busy = v;
-    if (v) {
-      el.sendBtn.classList.add("stop");
-      el.sendBtn.textContent = "■";
-      el.sendBtn.title = "Stop";
-    } else {
-      el.sendBtn.classList.remove("stop");
-      el.sendBtn.textContent = "➤";
-      el.sendBtn.title = "Send";
-    }
+    el.sendBtn.classList.toggle("stop", v);
+    el.sendBtn.textContent = v ? "■" : "➤";
+    el.sendBtn.title = v ? "Stop" : "Send";
     updateActionBar();
   }
 
@@ -456,16 +453,12 @@
     const provider = PROVIDERS[settings.provider] || PROVIDERS.gemini;
     const model = activeModel();
     const system = settings.systemPrompt || DEFAULT_SYSTEM;
-
-    if (provider.kind === "gemini") {
-      return streamGemini(model, system, messages, onDelta, signal);
-    }
+    if (provider.kind === "gemini") return streamGemini(model, system, messages, onDelta, signal);
     const baseUrl = settings.baseUrl || provider.baseUrl;
     if (!baseUrl) throw new Error("No base URL configured for this provider.");
     return streamOpenAI(baseUrl, model, system, messages, onDelta, signal);
   }
 
-  // Parse an SSE stream line-by-line, calling extract() on each data payload.
   async function readSSE(res, extract, onDelta) {
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -481,25 +474,24 @@
         if (!line || !line.startsWith("data:")) continue;
         const data = line.slice(5).trim();
         if (data === "[DONE]") return;
-        try {
-          onDelta(extract(JSON.parse(data)));
-        } catch {
-          /* ignore malformed/partial JSON lines */
-        }
+        try { onDelta(extract(JSON.parse(data))); } catch {}
       }
     }
   }
 
   async function errorFromResponse(res, label) {
     let data = {};
-    try {
-      data = await res.json();
-    } catch {}
-    const detail = data?.error?.message || data?.message || `HTTP ${res.status}`;
-    return new Error(`${label}: ${detail}`);
+    try { data = await res.json(); } catch {}
+    return new Error(`${label}: ${data?.error?.message || data?.message || "HTTP " + res.status}`);
   }
 
-  // Google Gemini streaming (Server-Sent Events).
+  // Turn a data-URL into a Gemini inlineData part.
+  function inlineData(dataUrl) {
+    const [meta, b64] = dataUrl.split(",");
+    const mime = (meta.match(/data:(.*?);base64/) || [, "image/png"])[1];
+    return { inlineData: { mimeType: mime, data: b64 } };
+  }
+
   async function streamGemini(model, system, messages, onDelta, signal) {
     const url =
       `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}` +
@@ -507,106 +499,105 @@
 
     const contents = messages.map((m) => ({
       role: m.role === "assistant" ? "model" : "user",
-      parts: [{ text: m.content }],
+      parts: [
+        ...(m.images || []).map(inlineData),
+        ...(m.content ? [{ text: m.content }] : []),
+      ],
     }));
-
-    const body = {
-      contents,
-      systemInstruction: { parts: [{ text: system }] },
-      generationConfig: { temperature: 0.7 },
-    };
 
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        contents,
+        systemInstruction: { parts: [{ text: system }] },
+        generationConfig: { temperature: 0.7 },
+      }),
       signal,
     });
     if (!res.ok) throw await errorFromResponse(res, "Gemini API error");
-
-    await readSSE(
-      res,
-      (json) => json?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || "",
-      onDelta
-    );
+    await readSSE(res, (j) => j?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || "", onDelta);
   }
 
-  // OpenAI-compatible streaming (Groq, OpenRouter, custom).
   async function streamOpenAI(baseUrl, model, system, messages, onDelta, signal) {
     const url = baseUrl.replace(/\/+$/, "") + "/chat/completions";
-    const body = {
-      model,
-      messages: [{ role: "system", content: system }, ...messages],
-      temperature: 0.7,
-      stream: true,
-    };
+    const mapped = messages.map((m) => {
+      if (m.images && m.images.length) {
+        return {
+          role: m.role,
+          content: [
+            ...(m.content ? [{ type: "text", text: m.content }] : []),
+            ...m.images.map((u) => ({ type: "image_url", image_url: { url: u } })),
+          ],
+        };
+      }
+      return { role: m.role, content: m.content };
+    });
     const res = await fetch(url, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: "Bearer " + settings.apiKey,
-      },
-      body: JSON.stringify(body),
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + settings.apiKey },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "system", content: system }, ...mapped],
+        temperature: 0.7,
+        stream: true,
+      }),
       signal,
     });
     if (!res.ok) throw await errorFromResponse(res, "API error");
-
-    await readSSE(res, (json) => json?.choices?.[0]?.delta?.content || "", onDelta);
+    await readSSE(res, (j) => j?.choices?.[0]?.delta?.content || "", onDelta);
   }
 
-  // ---- Voice input (Web Speech API) -------------------------------------
-  let recognition = null;
-  let listening = false;
-
+  // ---- Voice input (speech-to-text) -------------------------------------
+  let recognition = null, listening = false;
   function initVoice() {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) {
-      el.micBtn.hidden = true; // not supported (e.g. Firefox) — hide the button
-      return;
-    }
+    if (!SR) { el.micBtn.hidden = true; return; }
     el.micBtn.hidden = false;
     recognition = new SR();
-    recognition.lang = "en-US";
-    recognition.interimResults = true;
-    recognition.continuous = false;
-
+    recognition.lang = "en-US"; recognition.interimResults = true; recognition.continuous = false;
     let baseText = "";
     recognition.onstart = () => {
-      listening = true;
-      baseText = el.input.value ? el.input.value + " " : "";
-      el.micBtn.classList.add("listening");
-      el.micBtn.title = "Stop listening";
+      listening = true; baseText = el.input.value ? el.input.value + " " : "";
+      el.micBtn.classList.add("listening"); el.micBtn.title = "Stop listening";
     };
     recognition.onresult = (e) => {
-      let transcript = "";
-      for (let i = 0; i < e.results.length; i++) transcript += e.results[i][0].transcript;
-      el.input.value = baseText + transcript;
-      autoResize();
+      let t = ""; for (let i = 0; i < e.results.length; i++) t += e.results[i][0].transcript;
+      el.input.value = baseText + t; autoResize();
     };
     recognition.onerror = (e) => {
-      if (e.error === "not-allowed" || e.error === "service-not-allowed") {
-        toast("🎤 Microphone permission denied");
-      }
+      if (e.error === "not-allowed" || e.error === "service-not-allowed") toast("🎤 Microphone permission denied");
     };
     recognition.onend = () => {
-      listening = false;
-      el.micBtn.classList.remove("listening");
-      el.micBtn.title = "Voice input";
-      el.input.focus();
+      listening = false; el.micBtn.classList.remove("listening"); el.micBtn.title = "Voice input"; el.input.focus();
     };
   }
-
   function toggleVoice() {
     if (!recognition) return;
-    if (listening) {
-      recognition.stop();
-    } else {
-      try {
-        recognition.start();
-      } catch {
-        /* start() throws if already starting — ignore */
-      }
-    }
+    if (listening) recognition.stop();
+    else { try { recognition.start(); } catch {} }
+  }
+
+  // ---- Voice output (text-to-speech) ------------------------------------
+  let speakingBtn = null;
+  function stopSpeak() {
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
+    if (speakingBtn) { speakingBtn.textContent = "🔊 Speak"; speakingBtn = null; }
+  }
+  function toggleSpeak(text, btn, auto) {
+    if (!window.speechSynthesis) { if (!auto) toast("Speech not supported in this browser"); return; }
+    // Clicking the same speaking button stops it.
+    if (btn && btn === speakingBtn) { stopSpeak(); return; }
+    stopSpeak();
+    const clean = text
+      .replace(/```[\s\S]*?```/g, ". code block. ")
+      .replace(/`([^`]+)`/g, "$1")
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+      .replace(/[*_#>~]/g, "");
+    const u = new SpeechSynthesisUtterance(clean);
+    u.onend = () => { if (btn) btn.textContent = "🔊 Speak"; speakingBtn = null; };
+    if (btn) { btn.textContent = "⏹ Stop"; speakingBtn = btn; }
+    window.speechSynthesis.speak(u);
   }
 
   // ---- Settings UI ------------------------------------------------------
@@ -616,19 +607,17 @@
     el.model.value = settings.model;
     el.baseUrl.value = settings.baseUrl;
     el.systemPrompt.value = settings.systemPrompt;
+    el.autoSpeak.checked = !!settings.autoSpeak;
     syncProviderUI();
     el.settingsBackdrop.hidden = false;
   }
-  function closeSettings() {
-    el.settingsBackdrop.hidden = true;
-  }
+  function closeSettings() { el.settingsBackdrop.hidden = true; }
 
   function syncProviderUI() {
     const p = PROVIDERS[el.provider.value];
     el.keyHint.innerHTML = p.keyHint;
     const isCustom = el.provider.value === "custom";
-    el.baseUrl.hidden = !isCustom;
-    el.baseUrlRow.hidden = !isCustom;
+    el.baseUrl.hidden = !isCustom; el.baseUrlRow.hidden = !isCustom;
     if (!el.model.value) el.model.placeholder = p.defaultModel || "model name";
   }
 
@@ -638,80 +627,57 @@
     settings.model = el.model.value.trim();
     settings.baseUrl = el.baseUrl.value.trim();
     settings.systemPrompt = el.systemPrompt.value.trim() || DEFAULT_SYSTEM;
+    settings.autoSpeak = el.autoSpeak.checked;
     saveJSON(LS.settings, settings);
-    renderStatus();
-    closeSettings();
-    toast("Settings saved ✓");
+    populateModelSelect(); closeSettings(); toast("Settings saved ✓");
   }
 
   function clearAllData() {
     if (!confirm("Delete all chats and settings from this browser? This cannot be undone.")) return;
-    try {
-      localStorage.removeItem(LS.settings);
-      localStorage.removeItem(LS.chats);
-    } catch {}
-    chats = [];
-    currentId = null;
-    settings = { provider: "gemini", apiKey: "", model: "", baseUrl: "", systemPrompt: DEFAULT_SYSTEM };
-    renderHistory();
-    renderMessages();
-    renderStatus();
-    closeSettings();
+    try { localStorage.removeItem(LS.settings); localStorage.removeItem(LS.chats); } catch {}
+    chats = []; currentId = null; pendingImages = [];
+    settings = { provider: "gemini", apiKey: "", model: "", baseUrl: "", systemPrompt: DEFAULT_SYSTEM, autoSpeak: false };
+    renderHistory(); renderMessages(); renderAttachments(); populateModelSelect(); closeSettings();
     toast("All data cleared");
   }
 
   // ---- Theme ------------------------------------------------------------
-  function initTheme() {
-    const saved = localStorage.getItem(LS.theme) || "dark";
-    document.documentElement.setAttribute("data-theme", saved);
-  }
+  function initTheme() { document.documentElement.setAttribute("data-theme", localStorage.getItem(LS.theme) || "dark"); }
   function toggleTheme() {
-    const cur = document.documentElement.getAttribute("data-theme");
-    const next = cur === "dark" ? "light" : "dark";
+    const next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
     document.documentElement.setAttribute("data-theme", next);
-    try {
-      localStorage.setItem(LS.theme, next);
-    } catch {}
+    try { localStorage.setItem(LS.theme, next); } catch {}
   }
 
   // ---- Sidebar (mobile) -------------------------------------------------
-  function openSidebarMobile() {
-    el.sidebar.classList.add("open");
-  }
-  function closeSidebarMobile() {
-    el.sidebar.classList.remove("open");
-  }
+  const openSidebarMobile = () => el.sidebar.classList.add("open");
+  const closeSidebarMobile = () => el.sidebar.classList.remove("open");
 
   // ---- Composer behavior ------------------------------------------------
-  function autoResize() {
-    el.input.style.height = "auto";
-    el.input.style.height = Math.min(el.input.scrollHeight, 180) + "px";
-  }
+  function autoResize() { el.input.style.height = "auto"; el.input.style.height = Math.min(el.input.scrollHeight, 180) + "px"; }
 
   // ---- Event wiring -----------------------------------------------------
   function bind() {
     el.composer.addEventListener("submit", (e) => {
       e.preventDefault();
-      if (busy) {
-        stopGeneration();
-        return;
-      }
-      const text = el.input.value;
-      el.input.value = "";
-      autoResize();
-      sendMessage(text);
+      if (busy) { stopGeneration(); return; }
+      const text = el.input.value; el.input.value = ""; autoResize(); sendMessage(text);
     });
-
     el.input.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" && !e.shiftKey) {
-        e.preventDefault();
-        el.composer.requestSubmit();
-      }
+      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); el.composer.requestSubmit(); }
     });
     el.input.addEventListener("input", autoResize);
 
     el.micBtn.addEventListener("click", toggleVoice);
+    el.attachBtn.addEventListener("click", () => el.fileInput.click());
+    el.fileInput.addEventListener("change", (e) => { handleFiles(e.target.files); el.fileInput.value = ""; });
     el.regenBtn.addEventListener("click", regenerate);
+
+    el.modelSelect.addEventListener("change", () => {
+      settings.model = el.modelSelect.value;
+      saveJSON(LS.settings, settings);
+      toast("Model → " + settings.model);
+    });
 
     el.newChatBtn.addEventListener("click", newChat);
     el.openSettings.addEventListener("click", openSettings);
@@ -719,22 +685,15 @@
     el.saveSettings.addEventListener("click", saveSettings);
     el.clearData.addEventListener("click", clearAllData);
     el.themeToggle.addEventListener("click", toggleTheme);
-    el.provider.addEventListener("change", () => {
-      el.model.value = "";
-      syncProviderUI();
-    });
+    el.provider.addEventListener("change", () => { el.model.value = ""; syncProviderUI(); });
     el.toggleKey.addEventListener("click", () => {
       const show = el.apiKey.type === "password";
       el.apiKey.type = show ? "text" : "password";
       el.toggleKey.textContent = show ? "Hide" : "Show";
     });
-
     el.openSidebar.addEventListener("click", openSidebarMobile);
     el.closeSidebar.addEventListener("click", closeSidebarMobile);
-
-    el.settingsBackdrop.addEventListener("click", (e) => {
-      if (e.target === el.settingsBackdrop) closeSettings();
-    });
+    el.settingsBackdrop.addEventListener("click", (e) => { if (e.target === el.settingsBackdrop) closeSettings(); });
 
     document.querySelectorAll(".suggestion").forEach((btn) => {
       btn.addEventListener("click", () => {
@@ -751,20 +710,11 @@
 
   // ---- Init -------------------------------------------------------------
   function init() {
-    initTheme();
-    bind();
-    initVoice();
-    renderHistory();
-    renderMessages();
-    renderStatus();
-    if (!settings.apiKey) {
-      setTimeout(openSettings, 400); // first-run onboarding
-    }
+    initTheme(); bind(); initVoice();
+    renderHistory(); renderMessages(); renderAttachments(); populateModelSelect();
+    if (!settings.apiKey) setTimeout(openSettings, 400);
   }
 
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", init);
-  } else {
-    init();
-  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
+  else init();
 })();

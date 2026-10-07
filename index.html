@@ -41,7 +41,10 @@
       <header class="chat-header">
         <button class="icon-btn menu-btn" id="openSidebar" title="Menu" aria-label="Open menu">☰</button>
         <div class="header-title" id="headerTitle">New chat</div>
-        <div class="status-pill" id="statusPill" title="Current model">Not configured</div>
+        <div class="header-models">
+          <span class="provider-label" id="providerLabel">—</span>
+          <select class="model-select" id="modelSelect" title="Switch model" aria-label="Switch model"></select>
+        </div>
       </header>
 
       <div class="messages" id="messages">
@@ -64,7 +67,10 @@
         <div class="action-bar" id="actionBar" hidden>
           <button class="pill-btn" id="regenBtn" type="button" title="Regenerate last response">↻ Regenerate</button>
         </div>
+        <div class="attachments" id="attachments" hidden></div>
         <form class="composer" id="composer">
+          <button type="button" class="tool-btn" id="attachBtn" title="Attach image (vision)" aria-label="Attach image">🖼️</button>
+          <input type="file" id="fileInput" accept="image/*" multiple hidden />
           <textarea
             id="input"
             class="input"
@@ -72,7 +78,7 @@
             placeholder="Message the AI…  (Enter to send, Shift+Enter for new line)"
             autocomplete="off"
           ></textarea>
-          <button type="button" class="mic-btn" id="micBtn" title="Voice input" aria-label="Voice input" hidden>🎤</button>
+          <button type="button" class="tool-btn" id="micBtn" title="Voice input" aria-label="Voice input" hidden>🎤</button>
           <button type="submit" class="send-btn" id="sendBtn" title="Send" aria-label="Send message">➤</button>
         </form>
         <div class="composer-hint">
@@ -117,6 +123,8 @@
 
         <label class="field-label" for="systemPrompt">System prompt (personality / instructions)</label>
         <textarea id="systemPrompt" class="field" rows="3" placeholder="You are a helpful, friendly assistant."></textarea>
+
+        <label class="check-row"><input type="checkbox" id="autoSpeak" /> 🔊 Read replies aloud automatically</label>
 
         <div class="modal-actions">
           <button class="ghost-btn" id="clearData" type="button">🗑️ Clear all data</button>

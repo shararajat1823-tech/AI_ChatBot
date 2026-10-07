@@ -16,6 +16,10 @@ is never committed to the repo or sent anywhere except the AI provider they chos
 - ⚡ **Streaming replies** — text appears live, word by word, as the AI types
 - ⏹ **Stop** a running reply, and **↻ Regenerate** the last answer
 - 🎤 **Voice input** — dictate your message with the mic button (Web Speech API)
+- 🔊 **Voice output** — read replies aloud (per-message, or auto-read toggle)
+- 🖼️ **Image input (vision)** — attach a photo and ask about it (free on Gemini)
+- ✏️ **Edit & resend** your messages, and 📋 **copy** any message
+- 🔀 **Model picker** in the header — switch models mid-chat
 - 🛡️ **Request timeout + friendly errors** — never hangs; tells you *why* if something fails
 - 🌙 Dark / light theme toggle
 - 🧠 Conversation **memory** within a chat + multiple saved conversations
