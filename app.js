@@ -2,8 +2,12 @@
    AI ChatBot — front-end logic
    A static, GitHub-Pages-hostable chatbot. Each user brings their OWN free
    API key, which is stored only in their browser's localStorage.
+
    Supports: Google Gemini (native) + any OpenAI-compatible API (Groq,
    OpenRouter, custom).
+
+   Features: streaming replies, stop/regenerate, request timeout with
+   friendly errors, and voice input (Web Speech API).
    ========================================================================= */
 
 (() => {
@@ -32,7 +36,7 @@
       baseUrl: "https://openrouter.ai/api/v1",
       defaultModel: "meta-llama/llama-3.3-70b-instruct:free",
       keyHint:
-        'Get a free key at <a href="https://openrouter.ai/keys" target="_blank" rel="noopener">openrouter.ai/keys</a>. Use a model ending in <code>:free</code>.',
+        'Get a free key at <a href="https://openrouter.ai/keys" target="_blank" rel="noopener">openrouter.ai/keys</a>. Use a model ending in <code>:free</code>. Best choice for browser-only sites.',
     },
     custom: {
       label: "Custom",
@@ -44,6 +48,7 @@
   };
 
   const DEFAULT_SYSTEM = "You are a helpful, friendly, and concise AI assistant.";
+  const TIMEOUT_MS = 45000; // abort if no activity for this long
 
   // ---- State ------------------------------------------------------------
   const LS = {
@@ -63,6 +68,9 @@
   let chats = loadJSON(LS.chats, []); // [{id, title, messages:[{role, content}]}]
   let currentId = chats.length ? chats[0].id : null;
   let busy = false;
+  let currentAbort = null; // AbortController for the in-flight request
+  let stopRequested = false;
+  let timedOut = false;
 
   // ---- Element refs -----------------------------------------------------
   const $ = (id) => document.getElementById(id);
@@ -72,6 +80,9 @@
     input: $("input"),
     composer: $("composer"),
     sendBtn: $("sendBtn"),
+    micBtn: $("micBtn"),
+    actionBar: $("actionBar"),
+    regenBtn: $("regenBtn"),
     historyList: $("historyList"),
     headerTitle: $("headerTitle"),
     statusPill: $("statusPill"),
@@ -166,11 +177,13 @@
       el.messages.appendChild(el.welcome);
       el.welcome.style.display = "";
       el.headerTitle.textContent = chat ? chat.title : "New chat";
+      updateActionBar();
       return;
     }
     el.welcome.style.display = "none";
     chat.messages.forEach((m) => el.messages.appendChild(messageEl(m.role, m.content)));
     el.headerTitle.textContent = chat.title;
+    updateActionBar();
     scrollToBottom();
   }
 
@@ -234,6 +247,13 @@
     el.messages.scrollTop = el.messages.scrollHeight;
   }
 
+  function updateActionBar() {
+    const chat = currentChat();
+    const lastIsBot =
+      chat && chat.messages.length && chat.messages[chat.messages.length - 1].role === "assistant";
+    el.actionBar.hidden = !(lastIsBot && !busy);
+  }
+
   // ---- Chat management --------------------------------------------------
   function newChat() {
     const chat = { id: uid(), title: "New chat", messages: [] };
@@ -266,7 +286,7 @@
     saveJSON(LS.chats, chats);
   }
 
-  // ---- Sending a message ------------------------------------------------
+  // ---- Sending / generating ---------------------------------------------
   async function sendMessage(text) {
     text = text.trim();
     if (!text || busy) return;
@@ -283,7 +303,6 @@
       chat = currentChat();
     }
 
-    // Add user message
     chat.messages.push({ role: "user", content: text });
     if (chat.title === "New chat") {
       chat.title = text.slice(0, 40) + (text.length > 40 ? "…" : "");
@@ -295,63 +314,196 @@
     scrollToBottom();
     persist();
 
-    // Typing indicator
+    await generateReply(chat);
+  }
+
+  // Re-generate the reply to the most recent user message.
+  function regenerate() {
+    const chat = currentChat();
+    if (!chat || busy) return;
+    while (chat.messages.length && chat.messages[chat.messages.length - 1].role === "assistant") {
+      chat.messages.pop();
+    }
+    if (!chat.messages.some((m) => m.role === "user")) return;
+    persist();
+    renderMessages();
+    generateReply(chat);
+  }
+
+  // Core generation routine: streams the reply into a fresh bot bubble.
+  async function generateReply(chat) {
     setBusy(true);
-    const typingRow = typingIndicator();
-    el.messages.appendChild(typingRow);
+    stopRequested = false;
+    timedOut = false;
+
+    // Create the bot bubble up front; we stream text into it.
+    const row = document.createElement("div");
+    row.className = "msg-row bot";
+    row.innerHTML = `<div class="avatar bot">🤖</div><div class="bubble"></div>`;
+    const bubble = row.querySelector(".bubble");
+    bubble.innerHTML = `<div class="typing"><span></span><span></span><span></span></div>`;
+    el.messages.appendChild(row);
     scrollToBottom();
 
-    try {
-      const reply = await callAPI(chat.messages);
-      typingRow.remove();
-      chat.messages.push({ role: "assistant", content: reply });
-      el.messages.appendChild(messageEl("assistant", reply));
+    currentAbort = new AbortController();
+    let acc = "";
+    let gotFirst = false;
+    let lastPaint = 0;
+
+    const paint = (force) => {
+      const now = Date.now();
+      if (!force && now - lastPaint < 60) return;
+      lastPaint = now;
+      bubble.innerHTML = renderMarkdown(acc) + '<span class="stream-cursor"></span>';
       scrollToBottom();
+    };
+
+    let timer = setTimeout(() => {
+      timedOut = true;
+      if (currentAbort) currentAbort.abort();
+    }, TIMEOUT_MS);
+    const kick = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        timedOut = true;
+        if (currentAbort) currentAbort.abort();
+      }, TIMEOUT_MS);
+    };
+
+    const onDelta = (chunk) => {
+      if (!chunk) return;
+      if (!gotFirst) {
+        gotFirst = true;
+        bubble.innerHTML = "";
+      }
+      acc += chunk;
+      kick();
+      paint(false);
+    };
+
+    try {
+      await callAPIStream(chat.messages, onDelta, currentAbort.signal);
+      clearTimeout(timer);
+      finalizeBubble(bubble, acc || "_(empty response)_");
+      chat.messages.push({ role: "assistant", content: acc });
       persist();
     } catch (err) {
-      typingRow.remove();
-      const msg = "⚠️ **Error:** " + (err.message || "Something went wrong.");
-      chat.messages.push({ role: "assistant", content: msg });
-      el.messages.appendChild(messageEl("assistant", msg));
-      scrollToBottom();
+      clearTimeout(timer);
+      if (stopRequested && acc) {
+        // User stopped — keep whatever streamed so far.
+        finalizeBubble(bubble, acc + "\n\n_⏹ Stopped._");
+        chat.messages.push({ role: "assistant", content: acc + "\n\n_⏹ Stopped._" });
+      } else if (timedOut) {
+        const msg =
+          (acc ? acc + "\n\n" : "") +
+          "⚠️ **Request timed out.** The provider didn't respond in time. Check your model name/key, or try again.";
+        finalizeBubble(bubble, msg);
+        chat.messages.push({ role: "assistant", content: msg });
+      } else {
+        const msg = "⚠️ " + friendlyError(err);
+        finalizeBubble(bubble, msg);
+        chat.messages.push({ role: "assistant", content: msg });
+      }
       persist();
     } finally {
+      currentAbort = null;
       setBusy(false);
     }
   }
 
-  function typingIndicator() {
-    const row = document.createElement("div");
-    row.className = "msg-row bot";
-    row.innerHTML = `<div class="avatar bot">🤖</div>
-      <div class="bubble"><div class="typing"><span></span><span></span><span></span></div></div>`;
-    return row;
+  function finalizeBubble(bubble, text) {
+    bubble.innerHTML = renderMarkdown(text);
+    enhanceCodeBlocks(bubble);
+    scrollToBottom();
+  }
+
+  function stopGeneration() {
+    if (!busy || !currentAbort) return;
+    stopRequested = true;
+    currentAbort.abort();
+  }
+
+  function friendlyError(err) {
+    const m = (err && err.message) || String(err);
+    if (/Failed to fetch|NetworkError|Load failed|ERR_/i.test(m)) {
+      return (
+        "**Couldn't reach the AI provider.** The request was blocked before it got a response. Usually one of:\n\n" +
+        "- A **browser extension / ad-blocker** — try an **Incognito** window.\n" +
+        "- A **CORS** block — try switching **Provider → OpenRouter** in Settings (best for browser-only sites).\n" +
+        "- Your **network / firewall** blocking the API.\n\n" +
+        "Tip: press **F12 → Console** to see the exact reason."
+      );
+    }
+    return "**Error:** " + m;
   }
 
   function setBusy(v) {
     busy = v;
-    el.sendBtn.disabled = v;
+    if (v) {
+      el.sendBtn.classList.add("stop");
+      el.sendBtn.textContent = "■";
+      el.sendBtn.title = "Stop";
+    } else {
+      el.sendBtn.classList.remove("stop");
+      el.sendBtn.textContent = "➤";
+      el.sendBtn.title = "Send";
+    }
+    updateActionBar();
   }
 
-  // ---- API calls --------------------------------------------------------
-  async function callAPI(messages) {
+  // ---- API calls (streaming) --------------------------------------------
+  async function callAPIStream(messages, onDelta, signal) {
     const provider = PROVIDERS[settings.provider] || PROVIDERS.gemini;
     const model = activeModel();
     const system = settings.systemPrompt || DEFAULT_SYSTEM;
 
     if (provider.kind === "gemini") {
-      return callGemini(model, system, messages);
+      return streamGemini(model, system, messages, onDelta, signal);
     }
     const baseUrl = settings.baseUrl || provider.baseUrl;
     if (!baseUrl) throw new Error("No base URL configured for this provider.");
-    return callOpenAICompatible(baseUrl, model, system, messages);
+    return streamOpenAI(baseUrl, model, system, messages, onDelta, signal);
   }
 
-  // Google Gemini native REST API
-  async function callGemini(model, system, messages) {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-      model
-    )}:generateContent?key=${encodeURIComponent(settings.apiKey)}`;
+  // Parse an SSE stream line-by-line, calling extract() on each data payload.
+  async function readSSE(res, extract, onDelta) {
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, idx).trim();
+        buffer = buffer.slice(idx + 1);
+        if (!line || !line.startsWith("data:")) continue;
+        const data = line.slice(5).trim();
+        if (data === "[DONE]") return;
+        try {
+          onDelta(extract(JSON.parse(data)));
+        } catch {
+          /* ignore malformed/partial JSON lines */
+        }
+      }
+    }
+  }
+
+  async function errorFromResponse(res, label) {
+    let data = {};
+    try {
+      data = await res.json();
+    } catch {}
+    const detail = data?.error?.message || data?.message || `HTTP ${res.status}`;
+    return new Error(`${label}: ${detail}`);
+  }
+
+  // Google Gemini streaming (Server-Sent Events).
+  async function streamGemini(model, system, messages, onDelta, signal) {
+    const url =
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}` +
+      `:streamGenerateContent?alt=sse&key=${encodeURIComponent(settings.apiKey)}`;
 
     const contents = messages.map((m) => ({
       role: m.role === "assistant" ? "model" : "user",
@@ -368,28 +520,25 @@
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal,
     });
+    if (!res.ok) throw await errorFromResponse(res, "Gemini API error");
 
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      throw new Error(data?.error?.message || `Gemini API error (${res.status})`);
-    }
-    const parts = data?.candidates?.[0]?.content?.parts;
-    const text = parts?.map((p) => p.text).join("") || "";
-    if (!text) {
-      const reason = data?.candidates?.[0]?.finishReason;
-      throw new Error(reason ? `No response (${reason}).` : "Empty response from Gemini.");
-    }
-    return text;
+    await readSSE(
+      res,
+      (json) => json?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || "",
+      onDelta
+    );
   }
 
-  // OpenAI-compatible Chat Completions (Groq, OpenRouter, custom, etc.)
-  async function callOpenAICompatible(baseUrl, model, system, messages) {
+  // OpenAI-compatible streaming (Groq, OpenRouter, custom).
+  async function streamOpenAI(baseUrl, model, system, messages, onDelta, signal) {
     const url = baseUrl.replace(/\/+$/, "") + "/chat/completions";
     const body = {
       model,
       messages: [{ role: "system", content: system }, ...messages],
       temperature: 0.7,
+      stream: true,
     };
     const res = await fetch(url, {
       method: "POST",
@@ -398,14 +547,66 @@
         Authorization: "Bearer " + settings.apiKey,
       },
       body: JSON.stringify(body),
+      signal,
     });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      throw new Error(data?.error?.message || `API error (${res.status})`);
+    if (!res.ok) throw await errorFromResponse(res, "API error");
+
+    await readSSE(res, (json) => json?.choices?.[0]?.delta?.content || "", onDelta);
+  }
+
+  // ---- Voice input (Web Speech API) -------------------------------------
+  let recognition = null;
+  let listening = false;
+
+  function initVoice() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      el.micBtn.hidden = true; // not supported (e.g. Firefox) — hide the button
+      return;
     }
-    const text = data?.choices?.[0]?.message?.content || "";
-    if (!text) throw new Error("Empty response from the API.");
-    return text;
+    el.micBtn.hidden = false;
+    recognition = new SR();
+    recognition.lang = "en-US";
+    recognition.interimResults = true;
+    recognition.continuous = false;
+
+    let baseText = "";
+    recognition.onstart = () => {
+      listening = true;
+      baseText = el.input.value ? el.input.value + " " : "";
+      el.micBtn.classList.add("listening");
+      el.micBtn.title = "Stop listening";
+    };
+    recognition.onresult = (e) => {
+      let transcript = "";
+      for (let i = 0; i < e.results.length; i++) transcript += e.results[i][0].transcript;
+      el.input.value = baseText + transcript;
+      autoResize();
+    };
+    recognition.onerror = (e) => {
+      if (e.error === "not-allowed" || e.error === "service-not-allowed") {
+        toast("🎤 Microphone permission denied");
+      }
+    };
+    recognition.onend = () => {
+      listening = false;
+      el.micBtn.classList.remove("listening");
+      el.micBtn.title = "Voice input";
+      el.input.focus();
+    };
+  }
+
+  function toggleVoice() {
+    if (!recognition) return;
+    if (listening) {
+      recognition.stop();
+    } else {
+      try {
+        recognition.start();
+      } catch {
+        /* start() throws if already starting — ignore */
+      }
+    }
   }
 
   // ---- Settings UI ------------------------------------------------------
@@ -491,6 +692,10 @@
   function bind() {
     el.composer.addEventListener("submit", (e) => {
       e.preventDefault();
+      if (busy) {
+        stopGeneration();
+        return;
+      }
       const text = el.input.value;
       el.input.value = "";
       autoResize();
@@ -504,6 +709,9 @@
       }
     });
     el.input.addEventListener("input", autoResize);
+
+    el.micBtn.addEventListener("click", toggleVoice);
+    el.regenBtn.addEventListener("click", regenerate);
 
     el.newChatBtn.addEventListener("click", newChat);
     el.openSettings.addEventListener("click", openSettings);
@@ -545,14 +753,12 @@
   function init() {
     initTheme();
     bind();
+    initVoice();
     renderHistory();
     renderMessages();
     renderStatus();
-    // First-run: nudge the user to set up their key.
     if (!settings.apiKey) {
-      setTimeout(() => {
-        openSettings();
-      }, 400);
+      setTimeout(openSettings, 400); // first-run onboarding
     }
   }
 

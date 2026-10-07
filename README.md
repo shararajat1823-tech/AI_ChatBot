@@ -13,6 +13,10 @@ is never committed to the repo or sent anywhere except the AI provider they chos
 ## ✨ Features
 
 - 💬 Clean, modern chat UI (message bubbles, avatars, typing indicator)
+- ⚡ **Streaming replies** — text appears live, word by word, as the AI types
+- ⏹ **Stop** a running reply, and **↻ Regenerate** the last answer
+- 🎤 **Voice input** — dictate your message with the mic button (Web Speech API)
+- 🛡️ **Request timeout + friendly errors** — never hangs; tells you *why* if something fails
 - 🌙 Dark / light theme toggle
 - 🧠 Conversation **memory** within a chat + multiple saved conversations
 - 📝 Markdown rendering with **syntax-highlighted code blocks** and a copy button
