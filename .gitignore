@@ -1,0 +1,16 @@
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Dependencies / build (not used by this static site, but safe defaults)
+node_modules/
+dist/
+
+# Never commit secrets
+*.env
+.env*
+*secret*
+*apikey*

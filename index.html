@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="A free, open-source AI chatbot you can host on GitHub Pages. Bring your own free API key." />
+  <title>AI ChatBot</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🤖</text></svg>" />
+  <link rel="stylesheet" href="style.css" />
+  <!-- Markdown + code highlighting (loaded from CDN) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js" defer></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" defer></script>
+</head>
+<body>
+  <div class="app">
+    <!-- Sidebar -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <div class="brand">
+          <span class="brand-logo">🤖</span>
+          <span class="brand-name">AI ChatBot</span>
+        </div>
+        <button class="icon-btn" id="closeSidebar" title="Close menu" aria-label="Close menu">✕</button>
+      </div>
+
+      <button class="new-chat-btn" id="newChatBtn">
+        <span>＋</span> New chat
+      </button>
+
+      <div class="history" id="historyList" aria-label="Conversation history"></div>
+
+      <div class="sidebar-footer">
+        <button class="ghost-btn" id="openSettings">⚙️ Settings</button>
+        <button class="ghost-btn" id="themeToggle">🌙 Theme</button>
+      </div>
+    </aside>
+
+    <!-- Main chat area -->
+    <main class="chat">
+      <header class="chat-header">
+        <button class="icon-btn menu-btn" id="openSidebar" title="Menu" aria-label="Open menu">☰</button>
+        <div class="header-title" id="headerTitle">New chat</div>
+        <div class="status-pill" id="statusPill" title="Current model">Not configured</div>
+      </header>
+
+      <div class="messages" id="messages">
+        <!-- Welcome / empty state -->
+        <div class="welcome" id="welcome">
+          <div class="welcome-logo">🤖</div>
+          <h1>How can I help you today?</h1>
+          <p class="welcome-sub">A free AI chatbot. Add your own free API key in Settings to get started.</p>
+          <div class="suggestions">
+            <button class="suggestion">💡 Explain a tricky topic simply</button>
+            <button class="suggestion">✍️ Help me write an email</button>
+            <button class="suggestion">🐍 Write a Python function</button>
+            <button class="suggestion">🌍 Translate a sentence</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Composer -->
+      <div class="composer-wrap">
+        <form class="composer" id="composer">
+          <textarea
+            id="input"
+            class="input"
+            rows="1"
+            placeholder="Message the AI…  (Enter to send, Shift+Enter for new line)"
+            autocomplete="off"
+          ></textarea>
+          <button type="submit" class="send-btn" id="sendBtn" title="Send" aria-label="Send message">➤</button>
+        </form>
+        <div class="composer-hint">
+          Your messages are sent to your chosen AI provider using <strong>your own</strong> API key,
+          stored only in this browser.
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- Settings modal -->
+  <div class="modal-backdrop" id="settingsBackdrop" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+      <div class="modal-header">
+        <h2 id="settingsTitle">⚙️ Settings</h2>
+        <button class="icon-btn" id="closeSettings" aria-label="Close settings">✕</button>
+      </div>
+
+      <div class="modal-body">
+        <label class="field-label" for="provider">AI Provider</label>
+        <select id="provider" class="field">
+          <option value="gemini">Google Gemini — free tier (recommended)</option>
+          <option value="groq">Groq — free tier (fast, Llama models)</option>
+          <option value="openrouter">OpenRouter — has free models</option>
+          <option value="custom">Custom (OpenAI-compatible endpoint)</option>
+        </select>
+
+        <label class="field-label" for="apiKey">API Key</label>
+        <div class="key-row">
+          <input id="apiKey" class="field" type="password" placeholder="Paste your free API key here" autocomplete="off" />
+          <button class="ghost-btn small" id="toggleKey" type="button">Show</button>
+        </div>
+        <p class="hint" id="keyHint"></p>
+
+        <label class="field-label" for="model">Model</label>
+        <input id="model" class="field" type="text" placeholder="model name" />
+
+        <div class="field-label-row" id="baseUrlRow" hidden>
+          <label class="field-label" for="baseUrl">Base URL (OpenAI-compatible)</label>
+        </div>
+        <input id="baseUrl" class="field" type="text" placeholder="https://..." hidden />
+
+        <label class="field-label" for="systemPrompt">System prompt (personality / instructions)</label>
+        <textarea id="systemPrompt" class="field" rows="3" placeholder="You are a helpful, friendly assistant."></textarea>
+
+        <div class="modal-actions">
+          <button class="ghost-btn" id="clearData" type="button">🗑️ Clear all data</button>
+          <button class="primary-btn" id="saveSettings" type="button">Save</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <script src="app.js" defer></script>
+</body>
+</html>
